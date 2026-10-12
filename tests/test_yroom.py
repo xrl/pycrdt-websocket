@@ -1,20 +1,29 @@
 import pytest
-from anyio import TASK_STATUS_IGNORED, create_task_group, sleep
+from anyio import (
+    TASK_STATUS_IGNORED,
+    CancelScope,
+    Event,
+    create_memory_object_stream,
+    create_task_group,
+    move_on_after,
+    sleep,
+    wait_all_tasks_blocked,
+)
 from anyio.abc import TaskStatus
-from anyio.lowlevel import checkpoint
-from utils import Websocket, connected_websockets
+from utils import Websocket
 
 from pycrdt import (
+    Awareness,
     Doc,
     Map,
-    Provider,
     YMessageType,
     YSyncMessageType,
+    create_awareness_message,
     create_sync_message,
     create_update_message,
     handle_sync_message,
 )
-from pycrdt.websocket import exception_logger
+from pycrdt.websocket import WebsocketServer, exception_logger
 from pycrdt.websocket.yroom import YRoom
 
 pytestmark = pytest.mark.anyio
@@ -44,103 +53,6 @@ async def test_yroom(yroom, yws_providers, websocket_provider_connect, room_name
         tg.cancel_scope.cancel()
 
 
-async def test_broadcast_not_sent_before_sync_completes(room_name):
-    """Regression test: a client must not receive broadcast updates before the
-    initial sync handshake finishes.
-
-    When a new client connects, YRoom.serve() previously added it to
-    self.clients immediately — before sending SYNC_STEP2. If the server-side
-    document was mutated concurrently (e.g. by an MCP tool call adding cells),
-    _broadcast_updates would send a SYNC_UPDATE to the un-synced client.
-    The client's yjs would then throw "Unexpected case" in findIndexSS
-    because the update referenced a struct the client didn't have yet.
-
-    This test reproduces the race by:
-    1. Creating a YRoom with existing data
-    2. Connecting a new client
-    3. Mutating the server-side doc before the client finishes syncing
-    4. Asserting the client receives all data without errors
-    """
-    room = YRoom()
-    async with room:
-        # Pre-populate the room's document with data (simulates an existing notebook).
-        room.ydoc["map"] = server_map = Map()
-        server_map["existing"] = "data"
-
-        # Set up a fake WebSocket pair for the new client.
-        server_ws, client_ws = connected_websockets()
-        ws = Websocket(server_ws, room_name)
-
-        # Client document that will sync with the room.
-        client_doc = Doc()
-
-        async with create_task_group() as tg:
-            # Start serving the new client (this begins the sync handshake).
-            tg.start_soon(room.serve, ws)
-
-            # Simulate rapid server-side mutations DURING the handshake.
-            # In production this is caused by MCP add_cell calls from the AI agent.
-            for i in range(20):
-                server_map[f"cell_{i}"] = f"content_{i}"
-
-            # Give the sync some time to propagate.
-            await sleep(0.5)
-
-            # Connect a Provider on the client side to process the sync messages.
-            client_ws_wrapper = Websocket(client_ws, room_name)
-            async with Provider(client_doc, client_ws_wrapper):
-                await sleep(0.5)
-
-            # Verify the client received all data — if the race exists,
-            # the client would have crashed on "Unexpected case" and the
-            # map would be incomplete or empty.
-            client_map = client_doc.get("map", type=Map)
-            assert client_map["existing"] == "data"
-            for i in range(20):
-                assert client_map[f"cell_{i}"] == f"content_{i}", (
-                    f"Client missing cell_{i} — broadcast likely sent before sync completed"
-                )
-
-            tg.cancel_scope.cancel()
-
-
-@pytest.mark.parametrize(
-    "first_message_type", [YSyncMessageType.SYNC_STEP2, YSyncMessageType.SYNC_UPDATE]
-)
-async def test_client_added_after_sync_reply(room_name, first_message_type):
-    room = YRoom()
-    client_doc = Doc()
-    reply_sent = False
-
-    class HandshakeChannel:
-        path = room_name
-
-        async def __aiter__(self):
-            if first_message_type == YSyncMessageType.SYNC_STEP2:
-                message = handle_sync_message(create_sync_message(room.ydoc)[1:], client_doc)
-                assert message is not None
-            else:
-                message = create_update_message(client_doc.get_update())
-            yield message
-            assert self not in room.clients
-            yield create_sync_message(client_doc)
-            assert reply_sent
-            assert self in room.clients
-
-        async def send(self, message):
-            nonlocal reply_sent
-            assert self not in room.clients
-            if message[:2] == bytes((YMessageType.SYNC, YSyncMessageType.SYNC_STEP2)):
-                await checkpoint()
-                assert self not in room.clients
-                reply_sent = True
-
-    channel = HandshakeChannel()
-    await room.serve(channel)
-    assert reply_sent
-    assert channel not in room.clients
-
-
 @pytest.mark.parametrize("websocket_server_api", ["websocket_server_start_stop"], indirect=True)
 @pytest.mark.parametrize("yws_server", [{"exception_handler": exception_logger}], indirect=True)
 async def test_yroom_restart(yws_server, yws_provider):
@@ -163,3 +75,196 @@ async def test_yroom_restart(yws_server, yws_provider):
     assert yroom._task_group is not None
     assert not yroom._task_group.cancel_scope.cancel_called
     await yroom.stop()
+
+
+STEP1, STEP2, UPDATE = (bytes((YMessageType.SYNC, t)) for t in YSyncMessageType)
+
+
+class Peer:
+    # a client of the room: with hold=True, each message sent to it waits for release()
+    # before it is delivered, and a set failure is raised by the next delivery instead
+    path = "room"
+
+    def __init__(self, hold=False):
+        self.doc, self.hold, self.held, self.frames = Doc(), hold, [], []
+        self.synced, self.early, self.failure = False, False, None
+        self.inbox, self._inbox = create_memory_object_stream(16)
+        self.changed, self.done, self.scope = Event(), Event(), CancelScope()
+
+    def __aiter__(self):
+        return self._inbox
+
+    async def send(self, message):
+        self.frames.append(message)
+        self.early |= message[:2] == UPDATE and not self.synced
+        if self.hold:
+            self.held.append(released := Event())
+            self._change()
+            await released.wait()
+        if self.failure:
+            failure, self.failure = self.failure, None
+            raise failure
+        if message[0] == YMessageType.SYNC:
+            handle_sync_message(message[1:], self.doc)
+        self.synced |= message[:2] == STEP2
+        self._change()
+
+    def _change(self):
+        self.changed.set()
+        self.changed = Event()
+
+    def release(self):
+        self.held.pop(0).set()
+
+    async def until(self, condition):
+        # wait for what is sent to this peer to make condition true (the caller asserts it)
+        with move_on_after(5):
+            while not condition():
+                await self.changed.wait()
+
+    def map(self):
+        return self.doc.get("map", type=Map).to_py()
+
+
+async def serve(server, peer):
+    with peer.scope:
+        await server.serve(peer)
+    peer.done.set()
+
+
+async def join(server, tg):
+    # a is synced and gets the room's changes; b has sent an update, which is not a sync
+    # request, then its sync request, and its SYNC_STEP2 reply is encoded and held
+    a, b = Peer(), Peer(hold=True)
+    await a.inbox.send(create_sync_message(a.doc))
+    tg.start_soon(serve, server, a)
+    await a.until(lambda: a.synced)
+    room = server.rooms["room"]
+    await room.ydoc_observed.wait()
+    room.ydoc["map"] = Map({"x": "0", "y": "0"})
+    await a.until(lambda: a.map() == {"x": "0", "y": "0"})
+    b.doc["map"] = Map({"b": "0"})
+    await b.inbox.send(create_update_message(b.doc.get_update()))
+    await b.inbox.send(create_sync_message(b.doc))
+    tg.start_soon(serve, server, b)
+    await b.until(lambda: b.held)
+    b.release()  # the server's SYNC_STEP1
+    await b.until(lambda: b.held)
+    return room, a, b
+
+
+@pytest.mark.parametrize("held", ["reply", "catchup"])
+@pytest.mark.parametrize("change", ["insert", "delete"])
+async def test_change_while_joining(change, held):
+    # a change made while b's SYNC_STEP2 is held reaches b right after it, as does one
+    # made while that catch-up is held, and no update reaches b before its SYNC_STEP2
+    async with WebsocketServer() as server, create_task_group() as tg:
+        room, a, b = await join(server, tg)
+        if change == "insert":
+            room.ydoc["map"]["z"] = "0"
+        else:
+            del room.ydoc["map"]["x"]
+        await a.until(lambda: a.map() == room.ydoc["map"].to_py())
+        if held == "catchup":
+            b.release()  # b's SYNC_STEP2
+            await b.until(lambda: b.held)
+            del room.ydoc["map"]["y"]
+            await a.until(lambda: a.map() == room.ydoc["map"].to_py())
+        b.hold = False
+        while b.held:
+            b.release()
+        await b.until(lambda: b.map() == room.ydoc["map"].to_py())
+        assert b.map() == room.ydoc["map"].to_py()
+        assert not b.early
+        room.ydoc["map"]["w"] = "0"
+        await b.until(lambda: "w" in b.map())
+        assert "w" in b.map()
+        tg.cancel_scope.cancel()
+
+
+async def test_repeated_sync():
+    # while b's SYNC_STEP2 is held, b's next requests wait instead of each holding another
+    # snapshot, and they are answered in turn once b has caught up
+    async with WebsocketServer() as server, create_task_group() as tg:
+        room, a, b = await join(server, tg)
+        for _ in range(3):
+            await b.inbox.send(create_sync_message(b.doc))
+        room.ydoc["map"]["x"] = "1"
+        room.ydoc["map"]["x"] = "2"
+        await a.until(lambda: a.map() == room.ydoc["map"].to_py())
+        await wait_all_tasks_blocked()
+        assert len(b.held) == 1
+        b.hold = False
+        while b.held:
+            b.release()
+        await b.until(lambda: len(b.frames) == 6)
+        assert [frame[:2] for frame in b.frames] == [STEP1, STEP2, UPDATE, STEP2, STEP2, STEP2]
+        assert b.map() == room.ydoc["map"].to_py()
+        assert not b.early
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.parametrize("outcome", ["error", "cancel"])
+@pytest.mark.parametrize("held", ["reply", "catchup"])
+async def test_failure_while_joining(held, outcome):
+    # a failed send to a joining b goes to on_message_error with b's request, and b gets
+    # no update until it asks again; cancelling b's connection removes it from the room
+    errors = []
+    async with WebsocketServer() as server, create_task_group() as tg:
+        room, a, b = await join(server, tg)
+        room.on_message_error = lambda error, message, channel: not errors.append(
+            (error, message[:2], channel)
+        )
+        if held == "catchup":
+            room.ydoc["map"]["z"] = "0"
+            await a.until(lambda: a.map() == room.ydoc["map"].to_py())
+            b.release()  # b's SYNC_STEP2
+            await b.until(lambda: b.held)
+        if outcome == "cancel":
+            b.scope.cancel()
+            await b.done.wait()
+            assert b not in room.clients and b not in room._joining
+        else:
+            failure = b.failure = ConnectionError()
+            b.release()
+            await wait_all_tasks_blocked()
+            assert errors == [(failure, STEP1, b)]
+            sent = len(b.frames)
+            room.ydoc["map"]["w"] = "0"
+            await a.until(lambda: "w" in a.map())
+            await wait_all_tasks_blocked()
+            assert len(b.frames) == sent
+            b.hold = False
+            await b.inbox.send(create_sync_message(b.doc))
+            await b.until(lambda: b.map() == room.ydoc["map"].to_py())
+            assert b.map() == room.ydoc["map"].to_py()
+        room.ydoc["map"]["v"] = "0"
+        await a.until(lambda: "v" in a.map())
+        assert "v" in a.map()
+        tg.cancel_scope.cancel()
+
+
+async def test_room_lifetime():
+    # b counts as connected while joining, so it gets a's awareness, and the room stays
+    # open after a leaves; it closes when b leaves too
+    async with WebsocketServer(auto_clean_rooms=True) as server, create_task_group() as tg:
+        room, a, b = await join(server, tg)
+        awareness = Awareness(a.doc)
+        awareness.set_local_state({"name": "a"})
+        state = awareness.encode_awareness_update([a.doc.client_id])
+        await a.inbox.send(create_awareness_message(state))
+        await b.until(lambda: b.frames[-1][0] == YMessageType.AWARENESS)
+        assert b.frames[-1][0] == YMessageType.AWARENESS
+        b.held.pop().set()  # deliver it, while b's SYNC_STEP2 stays held
+        await a.inbox.aclose()
+        await a.done.wait()
+        assert server.rooms.get("room") is room
+        b.hold = False
+        while b.held:
+            b.release()
+        room.ydoc["map"]["w"] = "0"
+        await b.until(lambda: b.map() == room.ydoc["map"].to_py())
+        assert b.map() == room.ydoc["map"].to_py()
+        await b.inbox.aclose()
+        await b.done.wait()
+        assert "room" not in server.rooms

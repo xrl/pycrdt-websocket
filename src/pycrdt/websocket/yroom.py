@@ -108,6 +108,7 @@ class YRoom:
         self.awareness = Awareness(self.ydoc)
         self.awareness.observe(self.send_server_awareness)
         self.clients = set()
+        self._joining: dict[Channel, bool] = {}
         self._on_message = None
         self._on_message_error = None
         self.exception_handler = exception_handler
@@ -206,6 +207,10 @@ class YRoom:
                 if self.clients:
                     message = create_update_message(update)
                     for client in self.clients:
+                        if client in self._joining:
+                            # sent after its SYNC_STEP2, see _send_reply
+                            self._joining[client] = True
+                            continue
                         try:
                             self.log.debug(
                                 "Sending Y update to client with endpoint: %s", client.path
@@ -318,7 +323,8 @@ class YRoom:
         """
         try:
             async with create_task_group() as tg:
-                # Send our state vector to the client (SYNC_STEP1).
+                self.clients.add(channel)
+                self._joining[channel] = False
                 sync_message = create_sync_message(self.ydoc)
                 self.log.debug(
                     "Sending %s message to endpoint: %s",
@@ -326,13 +332,6 @@ class YRoom:
                     channel.path,
                 )
                 await channel.send(sync_message)
-                # Do not add the client to the broadcast list until the initial
-                # sync handshake is complete. Otherwise, concurrent document
-                # mutations (e.g. from MCP tool calls) trigger _broadcast_updates
-                # to send SYNC_UPDATE messages to this client before it has
-                # received the SYNC_STEP2 reply, causing the client-side yjs to
-                # throw "Unexpected case" in findIndexSS because the update
-                # references a struct the client doesn't have yet.
                 async for message in channel:
                     try:
                         # filter messages (e.g. awareness)
@@ -359,11 +358,9 @@ class YRoom:
                                     YSyncMessageType.SYNC_STEP2.name,
                                     channel.path,
                                 )
-                                await channel.send(reply)
-                                # The first sync exchange is complete — the client
-                                # now has all the data it needs. Safe to add to the
-                                # broadcast list for incremental updates.
-                                self.clients.add(channel)
+                                if channel in self._joining:
+                                    self._joining[channel] = False
+                                await self._send_reply(channel, reply, self.ydoc.get_state())
                         elif message_type == YMessageType.AWARENESS:
                             # forward awareness messages from this client to all clients,
                             # including itself, because it's used to keep the connection alive
@@ -401,9 +398,19 @@ class YRoom:
         except Exception as exception:
             self._handle_exception(exception)
         finally:
-            # remove this client (may not have been added if it disconnected
-            # before the sync handshake completed)
-            self.clients.discard(channel)
+            # remove this client
+            self.clients.remove(channel)
+            self._joining.pop(channel, None)
+
+    async def _send_reply(self, channel: Channel, reply: bytes, state: bytes) -> None:
+        # awaited by serve(), so a client's requests are answered one at a time; a joining
+        # client gets its SYNC_STEP2 before any update, then a diff of the ones it missed
+        await channel.send(reply)
+        while self._joining.get(channel):
+            self._joining[channel] = False
+            update, state = self.ydoc.get_update(state), self.ydoc.get_state()
+            await channel.send(create_update_message(update))
+        self._joining.pop(channel, None)
 
     def send_server_awareness(self, type: str, changes: tuple[dict[str, Any], Any]) -> None:
         """
