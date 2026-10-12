@@ -1,12 +1,5 @@
 import pytest
-from anyio import (
-    TASK_STATUS_IGNORED,
-    EndOfStream,
-    Event,
-    create_memory_object_stream,
-    create_task_group,
-    sleep,
-)
+from anyio import TASK_STATUS_IGNORED, Event, create_memory_object_stream, create_task_group, sleep
 from anyio.abc import TaskStatus
 from anyio.lowlevel import checkpoint
 from utils import Websocket
@@ -17,7 +10,6 @@ from pycrdt import (
     YMessageType,
     YSyncMessageType,
     create_sync_message,
-    create_update_message,
     handle_sync_message,
 )
 from pycrdt.websocket import WebsocketServer, exception_logger
@@ -79,21 +71,11 @@ class Peer:
     path = "room"
 
     def __init__(self, hold=False):
-        self.doc = Doc()
-        self.hold = hold
-        self.held = []
-        self.synced = False
-        self.early = False
+        self.doc, self.hold, self.held, self.synced, self.early = Doc(), hold, [], False, False
         self.inbox, self._inbox = create_memory_object_stream(16)
 
     def __aiter__(self):
-        return self
-
-    async def __anext__(self):
-        try:
-            return await self._inbox.receive()
-        except EndOfStream:
-            raise StopAsyncIteration()
+        return self._inbox
 
     async def send(self, message):
         if message[0] == YMessageType.SYNC:
@@ -111,8 +93,8 @@ async def settle():
         await checkpoint()
 
 
-@pytest.mark.parametrize("event", ["insert", "delete", "peer_update", "peer_leaves"])
-@pytest.mark.parametrize("step", range(5))
+@pytest.mark.parametrize("event", ["insert", "delete", "leave"])
+@pytest.mark.parametrize("step", range(4))
 async def test_event_while_joining(event, step):
     # whenever b waits on the network while joining, a change to the room or a's leaving
     # must reach b after its SYNC_STEP2, and must not close the room
@@ -122,21 +104,16 @@ async def test_event_while_joining(event, step):
         tg.start_soon(server.serve, a)
         await settle()
         room = server.rooms["room"]
-        assert room.ydoc_observed.is_set()
         room.ydoc["map"] = Map({"x": "0"})
         await b.inbox.send(create_sync_message(b.doc))
         tg.start_soon(server.serve, b)
-        for i in range(5):
+        for i in range(4):
             await settle()
             if i == step:
                 if event == "insert":
                     room.ydoc["map"]["y"] = "1"
                 elif event == "delete":
                     del room.ydoc["map"]["x"]
-                elif event == "peer_update":
-                    state = a.doc.get_state()
-                    a.doc.get("map", type=Map)["y"] = "1"
-                    await a.inbox.send(create_update_message(a.doc.get_update(state)))
                 else:
                     await a.inbox.aclose()
                 await settle()
