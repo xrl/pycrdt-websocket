@@ -1,20 +1,26 @@
 import pytest
-from anyio import TASK_STATUS_IGNORED, create_task_group, sleep
+from anyio import (
+    TASK_STATUS_IGNORED,
+    EndOfStream,
+    Event,
+    create_memory_object_stream,
+    create_task_group,
+    sleep,
+)
 from anyio.abc import TaskStatus
 from anyio.lowlevel import checkpoint
-from utils import Websocket, connected_websockets
+from utils import Websocket
 
 from pycrdt import (
     Doc,
     Map,
-    Provider,
     YMessageType,
     YSyncMessageType,
     create_sync_message,
     create_update_message,
     handle_sync_message,
 )
-from pycrdt.websocket import exception_logger
+from pycrdt.websocket import WebsocketServer, exception_logger
 from pycrdt.websocket.yroom import YRoom
 
 pytestmark = pytest.mark.anyio
@@ -44,103 +50,6 @@ async def test_yroom(yroom, yws_providers, websocket_provider_connect, room_name
         tg.cancel_scope.cancel()
 
 
-async def test_broadcast_not_sent_before_sync_completes(room_name):
-    """Regression test: a client must not receive broadcast updates before the
-    initial sync handshake finishes.
-
-    When a new client connects, YRoom.serve() previously added it to
-    self.clients immediately — before sending SYNC_STEP2. If the server-side
-    document was mutated concurrently (e.g. by an MCP tool call adding cells),
-    _broadcast_updates would send a SYNC_UPDATE to the un-synced client.
-    The client's yjs would then throw "Unexpected case" in findIndexSS
-    because the update referenced a struct the client didn't have yet.
-
-    This test reproduces the race by:
-    1. Creating a YRoom with existing data
-    2. Connecting a new client
-    3. Mutating the server-side doc before the client finishes syncing
-    4. Asserting the client receives all data without errors
-    """
-    room = YRoom()
-    async with room:
-        # Pre-populate the room's document with data (simulates an existing notebook).
-        room.ydoc["map"] = server_map = Map()
-        server_map["existing"] = "data"
-
-        # Set up a fake WebSocket pair for the new client.
-        server_ws, client_ws = connected_websockets()
-        ws = Websocket(server_ws, room_name)
-
-        # Client document that will sync with the room.
-        client_doc = Doc()
-
-        async with create_task_group() as tg:
-            # Start serving the new client (this begins the sync handshake).
-            tg.start_soon(room.serve, ws)
-
-            # Simulate rapid server-side mutations DURING the handshake.
-            # In production this is caused by MCP add_cell calls from the AI agent.
-            for i in range(20):
-                server_map[f"cell_{i}"] = f"content_{i}"
-
-            # Give the sync some time to propagate.
-            await sleep(0.5)
-
-            # Connect a Provider on the client side to process the sync messages.
-            client_ws_wrapper = Websocket(client_ws, room_name)
-            async with Provider(client_doc, client_ws_wrapper):
-                await sleep(0.5)
-
-            # Verify the client received all data — if the race exists,
-            # the client would have crashed on "Unexpected case" and the
-            # map would be incomplete or empty.
-            client_map = client_doc.get("map", type=Map)
-            assert client_map["existing"] == "data"
-            for i in range(20):
-                assert client_map[f"cell_{i}"] == f"content_{i}", (
-                    f"Client missing cell_{i} — broadcast likely sent before sync completed"
-                )
-
-            tg.cancel_scope.cancel()
-
-
-@pytest.mark.parametrize(
-    "first_message_type", [YSyncMessageType.SYNC_STEP2, YSyncMessageType.SYNC_UPDATE]
-)
-async def test_client_added_after_sync_reply(room_name, first_message_type):
-    room = YRoom()
-    client_doc = Doc()
-    reply_sent = False
-
-    class HandshakeChannel:
-        path = room_name
-
-        async def __aiter__(self):
-            if first_message_type == YSyncMessageType.SYNC_STEP2:
-                message = handle_sync_message(create_sync_message(room.ydoc)[1:], client_doc)
-                assert message is not None
-            else:
-                message = create_update_message(client_doc.get_update())
-            yield message
-            assert self not in room.clients
-            yield create_sync_message(client_doc)
-            assert reply_sent
-            assert self in room.clients
-
-        async def send(self, message):
-            nonlocal reply_sent
-            assert self not in room.clients
-            if message[:2] == bytes((YMessageType.SYNC, YSyncMessageType.SYNC_STEP2)):
-                await checkpoint()
-                assert self not in room.clients
-                reply_sent = True
-
-    channel = HandshakeChannel()
-    await room.serve(channel)
-    assert reply_sent
-    assert channel not in room.clients
-
-
 @pytest.mark.parametrize("websocket_server_api", ["websocket_server_start_stop"], indirect=True)
 @pytest.mark.parametrize("yws_server", [{"exception_handler": exception_logger}], indirect=True)
 async def test_yroom_restart(yws_server, yws_provider):
@@ -163,3 +72,82 @@ async def test_yroom_restart(yws_server, yws_provider):
     assert yroom._task_group is not None
     assert not yroom._task_group.cancel_scope.cancel_called
     await yroom.stop()
+
+
+class Peer:
+    # a client whose sends can be held, as on a slow network
+    path = "room"
+
+    def __init__(self, hold=False):
+        self.doc = Doc()
+        self.hold = hold
+        self.held = []
+        self.synced = False
+        self.early = False
+        self.inbox, self._inbox = create_memory_object_stream(16)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return await self._inbox.receive()
+        except EndOfStream:
+            raise StopAsyncIteration()
+
+    async def send(self, message):
+        if message[0] == YMessageType.SYNC:
+            self.early |= message[1] == YSyncMessageType.SYNC_UPDATE and not self.synced
+            handle_sync_message(message[1:], self.doc)
+        if self.hold:
+            self.held.append(held := Event())
+            await held.wait()
+        self.synced |= message[:2] == bytes((YMessageType.SYNC, YSyncMessageType.SYNC_STEP2))
+
+
+async def settle():
+    # let every task run until it waits on something
+    for _ in range(100):
+        await checkpoint()
+
+
+@pytest.mark.parametrize("event", ["insert", "delete", "peer_update", "peer_leaves"])
+@pytest.mark.parametrize("step", range(5))
+async def test_event_while_joining(event, step):
+    # whenever b waits on the network while joining, a change to the room or a's leaving
+    # must reach b after its SYNC_STEP2, and must not close the room
+    a, b = Peer(), Peer(hold=True)
+    async with WebsocketServer() as server, create_task_group() as tg:
+        await a.inbox.send(create_sync_message(a.doc))
+        tg.start_soon(server.serve, a)
+        await settle()
+        room = server.rooms["room"]
+        assert room.ydoc_observed.is_set()
+        room.ydoc["map"] = Map({"x": "0"})
+        await b.inbox.send(create_sync_message(b.doc))
+        tg.start_soon(server.serve, b)
+        for i in range(5):
+            await settle()
+            if i == step:
+                if event == "insert":
+                    room.ydoc["map"]["y"] = "1"
+                elif event == "delete":
+                    del room.ydoc["map"]["x"]
+                elif event == "peer_update":
+                    state = a.doc.get_state()
+                    a.doc.get("map", type=Map)["y"] = "1"
+                    await a.inbox.send(create_update_message(a.doc.get_update(state)))
+                else:
+                    await a.inbox.aclose()
+                await settle()
+            if b.held:
+                b.held.pop(0).set()
+        b.hold = False
+        for held in b.held:
+            held.set()
+        room.ydoc["map"]["z"] = "2"
+        await settle()
+        tg.cancel_scope.cancel()
+    assert server.rooms.get("room") is room
+    assert not b.early
+    assert b.doc.get("map", type=Map).to_py() == room.ydoc["map"].to_py()
