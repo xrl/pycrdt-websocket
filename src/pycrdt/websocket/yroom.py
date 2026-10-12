@@ -360,8 +360,7 @@ class YRoom:
                                 )
                                 if channel in self._joining:
                                     self._joining[channel] = False
-                                state = self.ydoc.get_state()
-                                tg.start_soon(self._send_reply, channel, reply, state)
+                                await self._send_reply(channel, reply, self.ydoc.get_state())
                         elif message_type == YMessageType.AWARENESS:
                             # forward awareness messages from this client to all clients,
                             # including itself, because it's used to keep the connection alive
@@ -404,8 +403,8 @@ class YRoom:
             self._joining.pop(channel, None)
 
     async def _send_reply(self, channel: Channel, reply: bytes, state: bytes) -> None:
-        # a joining client gets its SYNC_STEP2 before any update, and the updates
-        # it missed meanwhile right after, as a diff from the state of the reply
+        # awaited by serve(), so a client's requests are answered one at a time; a joining
+        # client gets its SYNC_STEP2 before any update, then a diff of the ones it missed
         await channel.send(reply)
         while self._joining.get(channel):
             self._joining[channel] = False
