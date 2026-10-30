@@ -210,7 +210,9 @@ class YRoom:
                             self.log.debug(
                                 "Sending Y update to client with endpoint: %s", client.path
                             )
-                            self._task_group.start_soon(client.send, message)
+                            self._task_group.start_soon(
+                                self._send_update_to_client, client, message
+                            )
                         except Exception as exception:
                             self._handle_exception(exception)
                 if self.ystore:
@@ -219,6 +221,15 @@ class YRoom:
                         self.log.debug("Writing Y update to YStore")
                     except Exception as exception:
                         self._handle_exception(exception)
+
+    async def _send_update_to_client(self, client: Channel, message: bytes) -> None:
+        try:
+            await client.send(message)
+        except Exception:
+            self.log.exception(
+                "Error while broadcasting Y update to client with endpoint: %s",
+                client.path,
+            )
 
     async def __aenter__(self) -> YRoom:
         async with self._start_lock:

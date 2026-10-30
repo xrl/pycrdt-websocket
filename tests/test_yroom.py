@@ -1,10 +1,10 @@
 import pytest
-from anyio import TASK_STATUS_IGNORED, create_task_group, sleep
+from anyio import TASK_STATUS_IGNORED, create_task_group, sleep, wait_all_tasks_blocked
 from anyio.abc import TaskStatus
 from anyio.lowlevel import checkpoint
-from utils import Websocket
+from utils import StartStopContextManager, Websocket
 
-from pycrdt import Map
+from pycrdt import Map, create_update_message
 from pycrdt.websocket import exception_logger
 from pycrdt.websocket.yroom import YRoom
 
@@ -71,6 +71,37 @@ class FakeClient:
         # Give failing sends an opportunity to interrupt this send.
         await checkpoint()
         self.messages.append(message)
+
+
+async def test_yroom_broadcast_send_error(yroom_api, caplog):
+    client1 = FakeClient("client1", RuntimeError("foo"))
+    client2 = FakeClient("client2")
+    room = YRoom()
+    if yroom_api == "yroom_start_stop":
+        room = StartStopContextManager(room)
+    async with room as yroom:
+        yroom.clients.update({client1, client2})
+        await yroom.ydoc_observed.wait()
+        ymap = yroom.ydoc.get("map", type=Map)
+        task_group = yroom._task_group
+        messages = []
+
+        for value in ("value1", "value2"):
+            state = yroom.ydoc.get_state()
+            ymap["key"] = value
+            messages.append(create_update_message(yroom.ydoc.get_update(state)))
+            await wait_all_tasks_blocked()
+            assert client2.messages == messages
+            assert yroom._task_group is task_group
+            assert not task_group.cancel_scope.cancel_called
+
+    records = [record for record in caplog.records if record.levelname == "ERROR"]
+    assert len(records) == 2
+    for record in records:
+        assert record.getMessage() == (
+            "Error while broadcasting Y update to client with endpoint: client1"
+        )
+        assert record.exc_info[1] is client1.error
 
 
 async def test_yroom_server_awareness_send_error(yroom, caplog):
